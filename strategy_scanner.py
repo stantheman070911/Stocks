@@ -255,9 +255,16 @@ def get_stock_list() -> pd.DataFrame:
     df = df[df["id"].str.match(r"^\d{4}$", na=False)].copy()
 
     # 排除金融股
+    # 修正：TWSE t187ap03_L API 的 `產業別` 是「數字代碼」（如 '17' = 金融保險業），
+    # 不是中文名稱；原程式用 FIN_KW 比對數字欄位，結果一檔都濾不掉。
+    # 改用「公司名稱」做關鍵字比對，並額外以 TWSE 產業代碼 17（金融保險業）兜底。
+    FIN_SECTOR_CODES = {"17"}
     before = len(df)
     df["sector"] = df["sector"].fillna("").astype(str)
-    df = df[~df["sector"].apply(lambda x: any(k in x for k in FIN_KW))]
+    df["name"]   = df["name"].fillna("").astype(str)
+    name_has_fin = df["name"].apply(lambda x: any(k in x for k in FIN_KW))
+    sector_is_fin = df["sector"].isin(FIN_SECTOR_CODES)
+    df = df[~(name_has_fin | sector_is_fin)].copy()
     print(f"  上市總數 {before} → 排除金融後 {len(df)} 檔")
 
     return df[["id", "name", "sector", "capital"]].reset_index(drop=True)
