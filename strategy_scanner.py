@@ -275,9 +275,11 @@ def get_stock_list() -> pd.DataFrame:
 # ════════════════════════════════════════════════════════════════
 
 def _fetch_foreign_day(date_str: str) -> pd.DataFrame | None:
-    """取得單日所有個股外資買賣超（TWSE TWT53U）"""
+    """取得單日所有個股外資買賣超（TWSE T86 — 三大法人買賣超日報）。
+    舊版 TWT53U 端點 TWSE 已下線並改導向 HTML 首頁，改用 T86。
+    """
     data = safe_get(
-        "https://www.twse.com.tw/fund/TWT53U",
+        "https://www.twse.com.tw/fund/T86",
         params={"response": "json", "date": date_str, "selectType": "ALLBUT0999"}
     )
     if not data or data.get("stat") != "OK" or not data.get("data"):
