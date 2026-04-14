@@ -7,39 +7,110 @@ Python 3.12+ | 執行前確認已安裝：pip install lxml openpyxl finmind
 import warnings
 warnings.filterwarnings("ignore")
 
-import os, time, re
+import logging
+import random
+import threading
+import time
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+from urllib.parse import urlparse
 
 import requests
+from requests.adapters import HTTPAdapter
 import pandas as pd
 import numpy as np
 import yfinance as yf
-import pandas_ta as ta
-from scipy import stats
 from tqdm import tqdm
+
+# ────────────────────────────────────────────────────────────────
+# 技術指標：優先使用 pandas_ta，若未安裝則 fallback 至內建計算
+# （pandas_ta 在 Python < 3.12 已從 PyPI 撤下，此 fallback 保障可執行）
+# ────────────────────────────────────────────────────────────────
+try:
+    import pandas_ta as _ta  # noqa: F401
+    _HAS_TA = True
+except Exception:
+    # 可能的失敗：未安裝 / numpy 2.x 相容性（np.NaN 被移除）/ setuptools 版本
+    _HAS_TA = False
+
+
+def _stoch_fallback(high: pd.Series, low: pd.Series, close: pd.Series,
+                    k: int = 9, d: int = 3, smooth_k: int = 3) -> pd.DataFrame:
+    """KD 隨機指標（%K/%D）內建實作。回傳兩欄 DataFrame。"""
+    ll = low.rolling(k).min()
+    hh = high.rolling(k).max()
+    denom = (hh - ll).replace(0, np.nan)
+    fast_k = 100 * (close - ll) / denom
+    slow_k = fast_k.rolling(smooth_k).mean()
+    slow_d = slow_k.rolling(d).mean()
+    return pd.DataFrame({
+        f"STOCHk_{k}_{d}_{smooth_k}": slow_k,
+        f"STOCHd_{k}_{d}_{smooth_k}": slow_d,
+    })
+
+
+def _stoch(high, low, close, k=9, d=3, smooth_k=3):
+    """優先走 pandas_ta，否則使用 fallback。"""
+    if _HAS_TA:
+        try:
+            return _ta.stoch(high, low, close, k=k, d=d, smooth_k=smooth_k)
+        except Exception as e:
+            log.debug("pandas_ta.stoch 失敗，改用 fallback：%s", e)
+    return _stoch_fallback(high, low, close, k=k, d=d, smooth_k=smooth_k)
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-import matplotlib.font_manager as fm
-# ════════════════════════════════════════════════════════════════
-#  ▌ 智慧隨機頻率調節器 (Monkey Patch)
-# ════════════════════════════════════════════════════════════════
-import random
-import threading
 
-# 備份原始的 requests.get
+# ════════════════════════════════════════════════════════════════
+#  ▌ Logging — 取代 print 中的錯誤訊息，保留管線進度輸出
+# ════════════════════════════════════════════════════════════════
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%H:%M:%S",
+)
+log = logging.getLogger("stocks")
+
+# ════════════════════════════════════════════════════════════════
+#  ▌ 智慧隨機頻率調節器 (Domain-aware Monkey Patch)
+#     - TWSE：嚴格序列化 + 延遲（防止被封鎖）
+#     - 其它網域（yfinance / FinMind）：輕量 jitter、不共用全域鎖
+#     - 所有請求共用 Session → 連線池 / TCP keepalive
+# ════════════════════════════════════════════════════════════════
+
 _original_get = requests.get
-# 建立執行緒鎖，防止多執行緒同時發送請求
-_request_lock = threading.Lock()
+_twse_lock    = threading.Lock()   # 僅 TWSE 共用的序列化鎖
+
+# 共用 Session（連線池 + Keep-Alive）大幅降低 TLS 建立成本
+_session = requests.Session()
+_adapter = HTTPAdapter(pool_connections=32, pool_maxsize=32, max_retries=0)
+_session.mount("https://", _adapter)
+_session.mount("http://",  _adapter)
+
+_TWSE_HOSTS = ("twse.com.tw", "openapi.twse.com.tw")
+
 
 def _smart_delayed_get(*args, **kwargs):
-    with _request_lock:
-        time.sleep(random.uniform(0.7,1.5 ))
-        return _original_get(*args, **kwargs)
+    """網域感知的節流器：TWSE 加鎖、其它加微抖動。"""
+    url  = args[0] if args else kwargs.get("url", "")
+    host = urlparse(url).netloc if url else ""
 
-# 覆寫底層的 requests.get，讓全域所有的爬蟲動作都套用此延遲規則
+    # 自動改用 Session（若呼叫端未指定）
+    if "timeout" not in kwargs:
+        kwargs["timeout"] = 15
+
+    if any(h in host for h in _TWSE_HOSTS):
+        with _twse_lock:
+            time.sleep(random.uniform(0.7, 1.5))
+            return _session.get(*args, **kwargs)
+
+    # 非 TWSE：輕量 jitter 避免與 yfinance 內部節流衝突
+    time.sleep(random.uniform(0.05, 0.15))
+    return _session.get(*args, **kwargs)
+
+
+# 覆寫 requests.get，所有子模組（含 yfinance 內部）皆套用
 requests.get = _smart_delayed_get
 
 # FinMind（可選，用於基本面）
@@ -75,7 +146,21 @@ MAX_WORKERS        = 15   # 平行下載執行緒
 # 金融股排除關鍵字
 FIN_KW = ["金融", "銀行", "保險", "證券", "票券", "投信", "期貨", "壽險", "產險", "租賃"]
 
-HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0 Safari/537.36"
+    ),
+    "Accept":          "application/json, text/plain, */*",
+    "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.8",
+}
+
+# 風險指標常數（集中，避免在函式內硬編碼）
+RISK_FREE_RATE     = 0.015          # 年化無風險利率
+TRADING_DAYS_YEAR  = 252
+BENCHMARK_TICKER   = "0050.TW"     # 台灣50 ETF — 大盤代理
+MIN_RISK_OBS       = 60            # 計算風險指標所需最少觀察值
 
 # ════════════════════════════════════════════════════════════════
 #  ▌ UTILITIES
@@ -91,14 +176,27 @@ def recent_weekdays(n: int = 50) -> list[str]:
     return result
 
 
-def safe_get(url: str, params: dict = None, retries: int = 3) -> dict | None:
+def safe_get(url: str, params: dict | None = None, retries: int = 3) -> dict | None:
+    """帶指數退避與 JSON 解析防禦的 GET。失敗回傳 None 不拋例外。"""
+    last_err: Exception | None = None
     for i in range(retries):
         try:
-            r = requests.get(url, params=params, headers=HEADERS, timeout=14)
+            r = requests.get(url, params=params, headers=HEADERS, timeout=15)
             if r.status_code == 200:
-                return r.json()
-        except Exception:
-            time.sleep(1.5 * (i + 1))
+                try:
+                    return r.json()
+                except ValueError as e:
+                    last_err = e
+                    log.debug("JSON 解析失敗 %s: %s", url, e)
+            else:
+                log.debug("HTTP %s 於 %s", r.status_code, url)
+        except requests.RequestException as e:
+            last_err = e
+            log.debug("請求失敗 %s（第 %d 次）：%s", url, i + 1, e)
+        # 指數退避（1.5s → 3s → 6s）+ 抖動
+        time.sleep(1.5 * (2 ** i) + random.uniform(0, 0.5))
+    if last_err:
+        log.debug("放棄 %s：%s", url, last_err)
     return None
 
 
@@ -212,15 +310,12 @@ def get_foreign_ranking(valid_ids: set) -> pd.DataFrame:
     # 累計買超（萬股）
     master["cum_net"] = master[day_cols].sum(axis=1) / 10000
 
-    # 連續買超天數（從最近日往前數，碰到非正即停）
-    bool_mat = master[day_cols].values > 0
-    consec   = np.zeros(len(master), dtype=int)
-    for j in range(bool_mat.shape[1]):
-        mask = bool_mat[:, j]
-        still_running = (consec == j)
-        consec[still_running & mask] += 1
-
-    master["consec_buy"] = consec
+    # 連續買超天數（從最近日往前數，碰到非正即停）— 全向量化
+    # day_cols 已依「新→舊」排序，對每列計算前綴全 True 的長度：
+    #   running_prod 為 bool 逐列累積 AND，True 代表自最新日起仍連續買超
+    bool_mat      = master[day_cols].to_numpy() > 0
+    running_prod  = np.logical_and.accumulate(bool_mat, axis=1)
+    master["consec_buy"] = running_prod.sum(axis=1).astype(int)
 
     # 只保留合法個股
     master = master[master.index.isin(valid_ids)]
@@ -245,17 +340,27 @@ def get_foreign_ranking(valid_ids: set) -> pd.DataFrame:
 #  ▌ STEP 3 ▸ 下載價量資料（平行）
 # ════════════════════════════════════════════════════════════════
 
+def _yf_download(ticker: str, min_rows: int = 60, retries: int = 2) -> pd.DataFrame | None:
+    """yfinance 封裝：自動展平 MultiIndex、列數不足視為失敗。"""
+    for i in range(retries + 1):
+        try:
+            raw = yf.download(ticker, start=START_DATE, end=END_DATE,
+                              progress=False, auto_adjust=True, timeout=20)
+            if raw is None or raw.empty or len(raw) < min_rows:
+                return None
+            if isinstance(raw.columns, pd.MultiIndex):
+                raw.columns = raw.columns.get_level_values(0)
+            need = [c for c in ["Open", "High", "Low", "Close", "Volume"] if c in raw.columns]
+            return raw[need].copy() if need else None
+        except Exception as e:
+            log.debug("yf.download(%s) 第 %d 次失敗：%s", ticker, i + 1, e)
+            time.sleep(0.8 * (i + 1))
+    return None
+
+
 def _dl_one(t: str) -> tuple:
-    try:
-        raw = yf.download(f"{t}.TW", start=START_DATE, end=END_DATE,
-                          progress=False, auto_adjust=True, timeout=15)
-        if raw.empty or len(raw) < 60:
-            return t, None
-        if isinstance(raw.columns, pd.MultiIndex):
-            raw.columns = raw.columns.get_level_values(0)
-        return t, raw[["Open", "High", "Low", "Close", "Volume"]].copy()
-    except Exception:
-        return t, None
+    df = _yf_download(f"{t}.TW", min_rows=60)
+    return t, df
 
 
 def download_prices(tickers: list[str]) -> dict:
@@ -299,9 +404,14 @@ def analyze_tech(t: str, df: pd.DataFrame) -> dict | None:
         days_on_ma20 = int((d["Close"].iloc[-20:] > d["ma20"].iloc[-20:]).sum())
 
         # ── KD（9日）───────────────────────────────────────────────
-        stoch = ta.stoch(d["High"], d["Low"], d["Close"], k=9, d=3, smooth_k=3)
-        K = float(stoch.iloc[-1, 0]) if stoch is not None and not stoch.empty else 50.0
-        D = float(stoch.iloc[-1, 1]) if stoch is not None and not stoch.empty else 50.0
+        stoch = _stoch(d["High"], d["Low"], d["Close"], k=9, d=3, smooth_k=3)
+        if stoch is not None and not stoch.empty and len(stoch) >= 1:
+            k_val = stoch.iloc[-1, 0]
+            d_val = stoch.iloc[-1, 1]
+            K = float(k_val) if pd.notna(k_val) else 50.0
+            D = float(d_val) if pd.notna(d_val) else 50.0
+        else:
+            K = D = 50.0
         kd_golden = int(K > D and K < 80)  # 金叉 + 未超買
 
         # ── Fibonacci（近60日）─────────────────────────────────────
@@ -391,38 +501,40 @@ def get_top_industries() -> set:
 
 def get_margin(tickers: list[str]) -> pd.DataFrame:
     print("\n【Step 6】取得融資融券餘額")
+    ticker_set = set(tickers)
     for date_str in recent_weekdays(5):
         data = safe_get(
             "https://www.twse.com.tw/exchangeReport/MI_MARGN",
             params={"response": "json", "date": date_str, "selectType": "ALL"}
         )
-        if data and data.get("stat") == "OK" and data.get("data"):
-            cols = data["fields"]
-            df   = pd.DataFrame(data["data"], columns=cols)
-            id_c = next((c for c in cols if "代號" in c or "代碼" in c), cols[0])
-            df["id"] = df[id_c].astype(str).str.strip()
-            df = df[df["id"].isin(set(tickers))].copy()
+        if not (data and data.get("stat") == "OK" and data.get("data")):
+            continue
 
-            # 標準化數字欄位
-            for c in [cc for cc in cols if cc not in [id_c, cols[1]]]:
-                df[c] = to_numeric_series(df[c])
+        cols = data["fields"]
+        df   = pd.DataFrame(data["data"], columns=cols)
+        id_c = next((c for c in cols if "代號" in c or "代碼" in c), cols[0])
+        df["id"] = df[id_c].astype(str).str.strip()
+        df = df[df["id"].isin(ticker_set)].copy()
+        if df.empty:
+            continue
 
-            # 融資餘額 / 融券餘額
-            mb_c = next((c for c in cols if "融資" in c and "餘額" in c and "股數" not in c), None)
-            ms_c = next((c for c in cols if "融券" in c and "餘額" in c and "股數" not in c), None)
+        # 融資 / 融券餘額欄位
+        mb_c = next((c for c in cols if "融資" in c and "餘額" in c and "股數" not in c), None)
+        ms_c = next((c for c in cols if "融券" in c and "餘額" in c and "股數" not in c), None)
 
-            rows = []
-            for _, row in df.iterrows():
-                mb = float(row[mb_c]) if mb_c and pd.notna(row.get(mb_c)) else 0.0
-                ms = float(row[ms_c]) if ms_c and pd.notna(row.get(ms_c)) else 0.0
-                # 嘎空比（融券/融資，越高嘎空潛力越大）
-                squeeze = ms / mb if mb > 0 else 0.0
-                rows.append({"id": row["id"], "margin_buy": mb,
-                              "margin_short": ms, "squeeze_ratio": round(squeeze, 4)})
+        # 僅轉換真正需要的欄位（避免整表 str→float 轉換成本）
+        mb = to_numeric_series(df[mb_c]).fillna(0.0) if mb_c else pd.Series(0.0, index=df.index)
+        ms = to_numeric_series(df[ms_c]).fillna(0.0) if ms_c else pd.Series(0.0, index=df.index)
+        squeeze = np.where(mb > 0, ms / mb.replace(0, np.nan), 0.0)
 
-            result = pd.DataFrame(rows)
-            print(f"  取得 {len(result)} 檔資料")
-            return result
+        result = pd.DataFrame({
+            "id":            df["id"].values,
+            "margin_buy":    mb.values,
+            "margin_short":  ms.values,
+            "squeeze_ratio": np.round(squeeze, 4),
+        })
+        print(f"  取得 {len(result)} 檔資料")
+        return result
 
     print("  ⚠ 融資融券 API 失敗，跳過")
     return pd.DataFrame()
@@ -482,36 +594,43 @@ def get_fundamentals(tickers: list[str]) -> pd.DataFrame:
 # ════════════════════════════════════════════════════════════════
 
 def calc_risk(t: str, df: pd.DataFrame, bench: pd.DataFrame) -> dict:
+    """Beta / Sharpe / Sortino（年化，rf=RISK_FREE_RATE）。失敗回傳 {}."""
     try:
         r = df["Close"].pct_change().dropna()
         b = bench["Close"].pct_change().dropna()
         aligned = pd.concat([r, b], axis=1, join="inner").dropna()
-        if len(aligned) < 60:
+        if len(aligned) < MIN_RISK_OBS:
             return {}
 
-        sr, br = aligned.iloc[:, 0], aligned.iloc[:, 1]
+        sr = aligned.iloc[:, 0].to_numpy()
+        br = aligned.iloc[:, 1].to_numpy()
 
-        # Beta
-        cov  = np.cov(sr.values, br.values)[0, 1]
-        vb   = np.var(br.values)
+        # Beta（cov/var）— 使用 ddof=0 保持和 np.var 一致
+        cov  = float(np.cov(sr, br, ddof=0)[0, 1])
+        vb   = float(np.var(br, ddof=0))
         beta = cov / vb if vb > 0 else np.nan
 
-        # Sharpe（年化，rf=1.5%）
-        rf_d   = 0.015 / 252
-        excess = sr - rf_d
-        sharpe = (excess.mean() / excess.std() * np.sqrt(252)) if excess.std() > 0 else np.nan
+        # 年化超額收益
+        rf_d     = RISK_FREE_RATE / TRADING_DAYS_YEAR
+        excess   = sr - rf_d
+        ex_mean  = float(excess.mean())
+        ex_std   = float(excess.std(ddof=1))
+        sq_root  = np.sqrt(TRADING_DAYS_YEAR)
 
-        # Sortino（下行波動）
-        down   = excess[excess < 0]
-        dstd   = down.std() if len(down) > 5 else np.nan
-        sortino = (excess.mean() / dstd * np.sqrt(252)) if dstd and dstd > 0 else np.nan
+        sharpe = (ex_mean / ex_std * sq_root) if ex_std > 0 else np.nan
+
+        # Sortino（只取下行波動）
+        downside = excess[excess < 0]
+        dstd     = float(downside.std(ddof=1)) if len(downside) > 5 else np.nan
+        sortino  = (ex_mean / dstd * sq_root) if dstd and dstd > 0 else np.nan
 
         return {
-            "beta":    round(beta,    3) if not np.isnan(beta)    else np.nan,
-            "sharpe":  round(sharpe,  3) if not np.isnan(sharpe)  else np.nan,
-            "sortino": round(sortino, 3) if not np.isnan(sortino) else np.nan,
+            "beta":    round(float(beta),    3) if not np.isnan(beta)    else np.nan,
+            "sharpe":  round(float(sharpe),  3) if not np.isnan(sharpe)  else np.nan,
+            "sortino": round(float(sortino), 3) if not np.isnan(sortino) else np.nan,
         }
-    except Exception:
+    except Exception as e:
+        log.debug("calc_risk(%s) 失敗：%s", t, e)
         return {}
 
 
@@ -643,10 +762,13 @@ def save_output(result: pd.DataFrame, entry: pd.DataFrame):
     axes[0].set_ylabel("股票數量")
     axes[0].set_title("評分分佈")
 
-    # 右：技術面 vs 外資連買天數（顏色=總分）
-    if "tech_score" in result.columns and "consec_buy" in result.columns:
+    # 右：技術面 vs 外資連買天數（顏色=總分）— 修正：原程式檢查英文欄名
+    # 但 DataFrame 以中文命名，導致散點圖從未被繪製。改為檢查實際存在的欄位。
+    tech_col  = "技術面分數"
+    consec_col = "連續外資買超天數"
+    if tech_col in result.columns and consec_col in result.columns:
         sc = axes[1].scatter(
-            result["tech_score"], result["consec_buy"],
+            result[tech_col], result[consec_col],
             c=result["total_score"], cmap="RdYlGn", alpha=0.75, s=45, vmin=0, vmax=100
         )
         plt.colorbar(sc, ax=axes[1], label="綜合評分")
@@ -689,12 +811,13 @@ def main():
     # ── 3. 價量資料 ───────────────────────────────────────────────
     price_data = download_prices(cand_ids)
 
-    # 大盤基準（0050）
-    bench_raw = yf.download("0050.TW", start=START_DATE, end=END_DATE,
-                             progress=False, auto_adjust=True)
-    if isinstance(bench_raw.columns, pd.MultiIndex):
-        bench_raw.columns = bench_raw.columns.get_level_values(0)
-    benchmark = bench_raw[["Close"]].copy() if not bench_raw.empty else pd.DataFrame()
+    # 大盤基準（0050）— 帶重試，避免一次失敗就讓所有風險指標為 NaN
+    bench_raw = _yf_download(BENCHMARK_TICKER, min_rows=60, retries=3)
+    if bench_raw is None or "Close" not in bench_raw.columns:
+        log.warning("⚠ 無法取得 %s 基準資料 → 風險指標將全部跳過", BENCHMARK_TICKER)
+        benchmark = pd.DataFrame()
+    else:
+        benchmark = bench_raw[["Close"]].copy()
 
     # ── 4. 技術分析 ───────────────────────────────────────────────
     print("\n【Step 4】技術面分析")
@@ -726,7 +849,11 @@ def main():
 
     # ── 9 & 10. 訊號 + 評分 ─────────────────────────────────────
     print("\n【Step 9/10】進場訊號 + 綜合評分")
-    f_idx    = foreign_df.set_index("id")
+
+    # 預先建立 dict 索引：O(1) 查詢取代 O(N) DataFrame 搜尋
+    f_idx     = foreign_df.set_index("id").to_dict("index")
+    meta_idx  = stock_df.set_index("id")[["name", "sector"]].to_dict("index")
+
     all_rows = []
     sig_rows = []
 
@@ -734,19 +861,19 @@ def main():
         if t not in tech_map:
             continue
 
-        f    = f_idx.loc[t] if t in f_idx.index else pd.Series(dtype=float)
-        tech = tech_map[t]
-        mg   = margin_map.get(t)
-        fu   = fund_map.get(t)
-        risk = risk_map.get(t, {})
-        consec = int(f.get("consec_buy", 0))
+        f_dict = f_idx.get(t, {})
+        f      = pd.Series(f_dict) if f_dict else pd.Series(dtype=float)
+        tech   = tech_map[t]
+        mg     = margin_map.get(t)
+        fu     = fund_map.get(t)
+        risk   = risk_map.get(t, {})
+        consec = int(f_dict.get("consec_buy", 0))
 
         score = score_stock(f, tech, mg, fu, risk)
 
-        # 股票基本資訊
-        meta   = stock_df[stock_df["id"] == t]
-        name   = meta["name"].values[0]   if len(meta) else ""
-        sector = meta["sector"].values[0] if len(meta) else ""
+        meta   = meta_idx.get(t, {})
+        name   = meta.get("name", "")
+        sector = meta.get("sector", "")
         ind_ok = int(not top_ind or any(ind in sector for ind in top_ind))
 
         row = {
@@ -755,9 +882,9 @@ def main():
             "產業別":        sector,
             "產業達標(前5)": ind_ok,
             # 外資
-            "外資累計淨買(萬股)": round(float(f.get("cum_net", 0)), 1),
+            "外資累計淨買(萬股)": round(float(f_dict.get("cum_net", 0)), 1),
             "連續外資買超天數":    consec,
-            "外資排名百分位":      round(float(f.get("rank_pct", 1.0)), 3),
+            "外資排名百分位":      round(float(f_dict.get("rank_pct", 1.0)), 3),
             # 技術
             "收盤價":   tech["close"],
             "MA20":     tech["ma20"],
@@ -782,7 +909,6 @@ def main():
             "Sortino": risk.get("sortino", np.nan),
             # 分數
             "技術面分數": tech["tech_score"],
-            "consec_buy": consec,
             "total_score": score,
         }
         all_rows.append(row)
