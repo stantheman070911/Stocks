@@ -65,7 +65,7 @@ All user-tunable parameters live in the `CONFIG` block at the top of `strategy_s
 | Step | Function | Data Source | Description |
 |------|----------|-------------|-------------|
 | 1 | `get_stock_list()` | TWSE openapi | Fetch ~1,600 listed stocks; exclude financials via `FIN_KW` |
-| 2 | `get_foreign_ranking()` | TWSE TWT53U | Scrape 30+ days of foreign buy/sell, rank by cumulative net buying + consecutive buy days |
+| 2 | `get_foreign_ranking()` | TWSE T86 | Scrape 30+ days of foreign buy/sell, rank by cumulative net buying + consecutive buy days (legacy TWT53U endpoint is dead) |
 | 3 | `download_prices()` | Yahoo Finance (yfinance) | Parallel OHLCV download for filtered candidates |
 | 4 | `analyze_tech()` | Local price data | MA20/60/120, KD stochastic, Fibonacci levels, volume ratio → `tech_score` (0–25) |
 | 5 | `get_top_industries()` | TWSE MI_INDEX20 | Identify top 5 sectors by trading volume |
@@ -91,9 +91,14 @@ Maximum score: **100 points**
 
 ---
 
-## Rate Limiting (lines 27–43)
+## Rate Limiting
 
-`requests.get` is monkey-patched globally at import time to inject a random `0.7–1.5 s` delay with a thread lock. This affects **all** HTTP calls including yfinance internals. Do not remove this — TWSE blocks rapid crawlers.
+`requests.get` is monkey-patched globally at import time with a **domain-aware** throttle:
+
+- **TWSE hosts** (`twse.com.tw`, `openapi.twse.com.tw`): serialized through a shared lock with a random `0.7–1.5 s` delay — TWSE aggressively blocks rapid crawlers.
+- **All other hosts** (Yahoo Finance, FinMind, etc.): light `0.05–0.15 s` jitter per thread, no shared lock. This preserves the `MAX_WORKERS` parallelism in Step 3.
+
+All requests also flow through a shared `requests.Session` backed by an `HTTPAdapter` (pool size 32) for connection reuse. Do not remove this — TWSE blocks rapid crawlers.
 
 ```python
 requests.get = _smart_delayed_get   # applied at module level
@@ -106,7 +111,7 @@ requests.get = _smart_delayed_get   # applied at module level
 | Source | URL Pattern | Auth |
 |---|---|---|
 | TWSE stock list | `openapi.twse.com.tw/v1/opendata/t187ap03_L` | None |
-| TWSE foreign investor daily | `www.twse.com.tw/fund/TWT53U?response=json&date=YYYYMMDD` | None |
+| TWSE foreign investor daily | `www.twse.com.tw/fund/T86?response=json&date=YYYYMMDD&selectType=ALLBUT0999` | None |
 | TWSE industry volume | `www.twse.com.tw/exchangeReport/MI_INDEX20` | None |
 | TWSE margin balances | `www.twse.com.tw/exchangeReport/MI_MARGN` | None |
 | Yahoo Finance | via `yfinance` library | None |
