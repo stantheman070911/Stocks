@@ -1,7 +1,7 @@
 """
 台股波段選股系統 v1.0
 策略：外資買超中後段排名 + 技術面 + 融資融券 + 基本面 + 風險指標
-Python 3.12+ | 執行前確認已安裝：pip install lxml openpyxl finmind
+Python 3.10+ | 執行前確認已安裝：pip install lxml openpyxl yfinance pandas numpy scipy tqdm matplotlib requests
 """
 
 import warnings
@@ -16,7 +16,6 @@ import requests
 import pandas as pd
 import numpy as np
 import yfinance as yf
-import pandas_ta as ta
 from scipy import stats
 from tqdm import tqdm
 import matplotlib
@@ -130,7 +129,6 @@ def get_stock_list() -> pd.DataFrame:
         raise RuntimeError("TWSE 股票清單 API 無回應，請確認網路連線")
 
     df = pd.DataFrame(data)
-    print(f"  API 原始欄位：{list(df.columns)}")   # 除錯用：印出實際欄位名
 
     # ── 關鍵字模糊偵測欄位（不受 TWSE 改欄名影響）────────────────
     id_col      = _find_col(df.columns, ["代號", "代碼", "Code", "ID"])
@@ -196,7 +194,7 @@ def get_foreign_ranking(valid_ids: set) -> pd.DataFrame:
     dates = recent_weekdays(LOOKUP_DAYS + 12)[:LOOKUP_DAYS + 12]
 
     frames = []
-    with ThreadPoolExecutor(max_workers=6) as pool:
+    with ThreadPoolExecutor(max_workers=1) as pool:
         futs = {pool.submit(_fetch_foreign_day, d): d for d in dates}
         for f in tqdm(as_completed(futs), total=len(futs), desc="  外資日資料", ncols=72):
             res = f.result()
@@ -299,9 +297,14 @@ def analyze_tech(t: str, df: pd.DataFrame) -> dict | None:
         days_on_ma20 = int((d["Close"].iloc[-20:] > d["ma20"].iloc[-20:]).sum())
 
         # ── KD（9日）───────────────────────────────────────────────
-        stoch = ta.stoch(d["High"], d["Low"], d["Close"], k=9, d=3, smooth_k=3)
-        K = float(stoch.iloc[-1, 0]) if stoch is not None and not stoch.empty else 50.0
-        D = float(stoch.iloc[-1, 1]) if stoch is not None and not stoch.empty else 50.0
+        _lo9   = d["Low"].rolling(9).min()
+        _hi9   = d["High"].rolling(9).max()
+        _rng9  = (_hi9 - _lo9).replace(0, np.nan)
+        _raw_k = 100 * (d["Close"] - _lo9) / _rng9
+        _k_line = _raw_k.rolling(3).mean()    # smooth_k=3
+        _d_line = _k_line.rolling(3).mean()   # d=3
+        K = float(_k_line.iloc[-1]) if pd.notna(_k_line.iloc[-1]) else 50.0
+        D = float(_d_line.iloc[-1]) if pd.notna(_d_line.iloc[-1]) else 50.0
         kd_golden = int(K > D and K < 80)  # 金叉 + 未超買
 
         # ── Fibonacci（近60日）─────────────────────────────────────
