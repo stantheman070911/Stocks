@@ -146,6 +146,64 @@ MAX_WORKERS        = 15   # 平行下載執行緒
 # 金融股排除關鍵字
 FIN_KW = ["金融", "銀行", "保險", "證券", "票券", "投信", "期貨", "壽險", "產險", "租賃"]
 
+# BFIAMU 類股名稱（去除「指數」後綴）→ TWSE t187ap03_L 產業別代碼
+# 修正 FIND-2：top_ind 是中文類別名稱，stock_df["sector"] 是數字代碼，
+# 直接做子字串比對永遠 False；改用此對照表轉換為代碼集合再比對。
+BFIAMU_TO_TWSE_CODES: dict[str, set[str]] = {
+    "水泥工業":         {"01"},
+    "食品工業":         {"02"},
+    "塑膠工業":         {"03"},
+    "紡織纖維":         {"04"},
+    "電機機械":         {"05"},
+    "電器電纜":         {"06"},
+    "化學工業":         {"07", "21"},
+    "生技醫療業":       {"22"},
+    "生技醫療":         {"22"},
+    "玻璃陶瓷":         {"08"},
+    "造紙工業":         {"09"},
+    "鋼鐵工業":         {"10"},
+    "橡膠工業":         {"11"},
+    "汽車工業":         {"12"},
+    # 電子工業（BFIAMU 廣義類）涵蓋 t187ap03_L 的舊電子代碼及所有電子子板塊
+    "電子工業":         {"13", "24", "25", "26", "27", "28", "29", "30", "31"},
+    "建材營造":         {"14"},
+    "航運業":           {"15"},
+    "航運":             {"15"},
+    "觀光事業":         {"16"},
+    "觀光":             {"16"},
+    "金融保險業":       {"17"},
+    "金融保險":         {"17"},
+    "貿易百貨":         {"18"},
+    "油電燃氣業":       {"23"},
+    "油電燃氣":         {"23"},
+    "半導體業":         {"24"},
+    "半導體":           {"24"},
+    "電腦及周邊設備業": {"25"},
+    "電腦及周邊設備":   {"25"},
+    "光電業":           {"26"},
+    "光電":             {"26"},
+    "通信網路業":       {"27"},
+    "通信網路":         {"27"},
+    "電子零組件業":     {"28"},
+    "電子零組件":       {"28"},
+    "電子通路業":       {"29"},
+    "電子通路":         {"29"},
+    "資訊服務業":       {"30"},
+    "資訊服務":         {"30"},
+    "其他電子業":       {"31"},
+    "其他電子":         {"31"},
+    "文化創意業":       {"32"},
+    "文化創意":         {"32"},
+    "農業科技業":       {"33"},
+    "農業科技":         {"33"},
+    "電子商務業":       {"34"},
+    "電子商務":         {"34"},
+    "綠能環保":         {"35"},
+    "數位雲端":         {"36"},
+    "運動休閒":         {"37"},
+    "居家生活":         {"38"},
+}
+
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -632,6 +690,13 @@ def calc_risk(t: str, df: pd.DataFrame, bench: pd.DataFrame) -> dict:
     try:
         r = df["Close"].pct_change().dropna()
         b = bench["Close"].pct_change().dropna()
+        # 修正 D23：yfinance 新版對部分市場回傳 tz-aware 時間戳；
+        # 若一側 tz-aware 另一側 tz-naive，join="inner" 靜默回傳空 frame。
+        # 統一轉換為 tz-naive（UTC 轉換後去除 tzinfo）以確保正確對齊。
+        if getattr(r.index, "tz", None) is not None:
+            r = r.tz_convert(None)
+        if getattr(b.index, "tz", None) is not None:
+            b = b.tz_convert(None)
         aligned = pd.concat([r, b], axis=1, join="inner").dropna()
         if len(aligned) < MIN_RISK_OBS:
             return {}
@@ -908,7 +973,13 @@ def main():
         meta   = meta_idx.get(t, {})
         name   = meta.get("name", "")
         sector = meta.get("sector", "")
-        ind_ok = int(not top_ind or any(ind in sector for ind in top_ind))
+        # 修正 FIND-2：top_ind 含中文類別名稱（如「電子工業」），
+        # sector 是數字代碼（如「24」），不可直接做子字串比對。
+        # 透過 BFIAMU_TO_TWSE_CODES 把類別名稱轉為代碼集合再判斷。
+        top_codes: set[str] = set().union(
+            *(BFIAMU_TO_TWSE_CODES.get(n, set()) for n in top_ind)
+        )
+        ind_ok = int(not top_codes or sector in top_codes)
 
         row = {
             "股票代號":      t,
