@@ -483,10 +483,14 @@ def analyze_tech(t: str, df: pd.DataFrame) -> dict | None:
 # ════════════════════════════════════════════════════════════════
 
 def get_top_industries() -> set:
+    """取得類股別（industry class）成交金額前 N 大。
+    修正：原使用的 MI_INDEX20 其實是「個股」成交量前20，並非類股分類；
+    正確端點應為 BFIAMU（類股別成交資訊）。
+    """
     print("\n【Step 5】取得產業別成交量前5排名")
     for date_str in recent_weekdays(5):
         data = safe_get(
-            "https://www.twse.com.tw/exchangeReport/MI_INDEX20",
+            "https://www.twse.com.tw/exchangeReport/BFIAMU",
             params={"response": "json", "date": date_str}
         )
         if data and data.get("stat") == "OK" and data.get("data"):
@@ -495,9 +499,11 @@ def get_top_industries() -> set:
             vol_c  = next((c for c in cols if "成交金額" in c or "成交值" in c), None)
             idx_c  = next((c for c in cols if "指數" in c or "類別" in c or "類股" in c), None)
             if vol_c and idx_c:
-                df[vol_c] = to_numeric_series(df[vol_c])
+                df[vol_c]  = to_numeric_series(df[vol_c])
+                df[idx_c]  = df[idx_c].astype(str).str.strip()
                 df = df.dropna(subset=[vol_c]).sort_values(vol_c, ascending=False)
-                tops = set(df[idx_c].head(TOP_INDUSTRY_COUNT).tolist())
+                # 去除「指數」後綴，便於後續 `any(ind in sector ...)` 子字串比對
+                tops = set(df[idx_c].str.replace("指數", "", regex=False).head(TOP_INDUSTRY_COUNT).tolist())
                 print(f"  前{TOP_INDUSTRY_COUNT}大產業：{tops}")
                 return tops
     print("  ⚠ 產業成交量 API 失敗，跳過此過濾")
@@ -509,31 +515,50 @@ def get_top_industries() -> set:
 # ════════════════════════════════════════════════════════════════
 
 def get_margin(tickers: list[str]) -> pd.DataFrame:
+    """融資融券彙總。
+    修正：TWSE 已將舊 `exchangeReport/MI_MARGN` 的 flat `data[]` schema
+    重構為 `rwd/zh/marginTrading/MI_MARGN`，回應裡是 `tables[]`，
+    第二張表才是「融資融券彙總(全部)」明細。舊端點現在雖 HTTP 200
+    卻回傳 0 列，所以原本的流程從未成功。
+    同時：欄位有重複名稱（融資/融券各一組「買進/賣出/今日餘額」），
+    需以「位置」索引取得今日餘額，而非以欄名 next() 搜尋。
+    """
     print("\n【Step 6】取得融資融券餘額")
     ticker_set = set(tickers)
     for date_str in recent_weekdays(5):
         data = safe_get(
-            "https://www.twse.com.tw/exchangeReport/MI_MARGN",
+            "https://www.twse.com.tw/rwd/zh/marginTrading/MI_MARGN",
             params={"response": "json", "date": date_str, "selectType": "ALL"}
         )
-        if not (data and data.get("stat") == "OK" and data.get("data")):
+        if not (data and data.get("stat") == "OK"):
             continue
 
-        cols = data["fields"]
-        df   = pd.DataFrame(data["data"], columns=cols)
-        id_c = next((c for c in cols if "代號" in c or "代碼" in c), cols[0])
-        df["id"] = df[id_c].astype(str).str.strip()
+        # 找出「融資融券彙總」細明表：欄位數最多者
+        tables = data.get("tables") or []
+        detail = max(tables, key=lambda t: len(t.get("fields", [])), default=None)
+        if not detail or not detail.get("data"):
+            continue
+
+        cols = detail["fields"]
+        rows = detail["data"]
+        # 標準 schema（16 欄）：代號, 名稱,
+        #   [融資] 買進,賣出,現金償還,前日餘額,今日餘額,次一限額,
+        #   [融券] 買進,賣出,現券償還,前日餘額,今日餘額,次一限額,
+        #   資券互抵, 註記
+        if len(cols) < 13:
+            log.debug("MI_MARGN 欄位數不足（%d）", len(cols))
+            continue
+
+        df = pd.DataFrame(rows, columns=[f"c{i}" for i in range(len(cols))])
+        df["id"] = df["c0"].astype(str).str.strip()
         df = df[df["id"].isin(ticker_set)].copy()
         if df.empty:
             continue
 
-        # 融資 / 融券餘額欄位
-        mb_c = next((c for c in cols if "融資" in c and "餘額" in c and "股數" not in c), None)
-        ms_c = next((c for c in cols if "融券" in c and "餘額" in c and "股數" not in c), None)
-
-        # 僅轉換真正需要的欄位（避免整表 str→float 轉換成本）
-        mb = to_numeric_series(df[mb_c]).fillna(0.0) if mb_c else pd.Series(0.0, index=df.index)
-        ms = to_numeric_series(df[ms_c]).fillna(0.0) if ms_c else pd.Series(0.0, index=df.index)
+        # 位置索引取今日餘額（融資第 6 欄 / 融券第 12 欄）
+        mb = to_numeric_series(df["c6"]).fillna(0.0)
+        ms = to_numeric_series(df["c12"]).fillna(0.0)
+        # 嘎空比 = 融券/融資
         squeeze = np.where(mb > 0, ms / mb.replace(0, np.nan), 0.0)
 
         result = pd.DataFrame({
