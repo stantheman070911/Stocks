@@ -100,7 +100,7 @@ except ImportError:
 #  ▌ CONFIG — 只需修改這區
 # ════════════════════════════════════════════════════════════════
 
-FINMIND_TOKEN = ""           # finmindtrade.com 免費註冊後填入（可空白，跳過基本面）
+FINMIND_TOKEN = "REMOVED_FINMIND_TOKEN"  # finmindtrade.com 免費註冊後填入（可空白，跳過基本面）
 LOOKUP_DAYS   = 30                               # 外資統計天數
 LOOKBACK_DAYS = 730                              # 價量回看天數
 BATCH_SIZE    = 50                               # yfinance 批次下載檔數
