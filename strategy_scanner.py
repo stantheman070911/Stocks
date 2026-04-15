@@ -10,6 +10,7 @@ warnings.filterwarnings("ignore")
 import argparse
 import json
 import logging
+import os
 import random
 import re
 import threading
@@ -26,6 +27,19 @@ import pandas as pd
 import numpy as np
 import yfinance as yf
 from tqdm import tqdm
+
+try:
+    from dotenv import load_dotenv
+except ImportError:
+    load_dotenv = None
+
+try:
+    from tw_scanner import __version__ as APP_VERSION
+except ImportError:
+    APP_VERSION = "0.0.0"
+
+if load_dotenv is not None:
+    load_dotenv()
 
 # ────────────────────────────────────────────────────────────────
 # 技術指標：優先使用 pandas_ta，若未安裝則 fallback 至內建計算
@@ -100,7 +114,7 @@ except ImportError:
 #  ▌ CONFIG — 只需修改這區
 # ════════════════════════════════════════════════════════════════
 
-FINMIND_TOKEN = "REMOVED_FINMIND_TOKEN"  # finmindtrade.com 免費註冊後填入（可空白，跳過基本面）
+FINMIND_TOKEN = os.environ.get("FINMIND_TOKEN", "").strip()  # finmindtrade.com 免費註冊後填入 .env（可空白，跳過基本面）
 LOOKUP_DAYS   = 30                               # 外資統計天數
 LOOKBACK_DAYS = 730                              # 價量回看天數
 BATCH_SIZE    = 50                               # yfinance 批次下載檔數
@@ -1487,6 +1501,7 @@ def main(cfg: RunConfig):
     print("═" * 60)
 
     manifest: dict = {
+        "version": APP_VERSION,
         "as_of": cfg.as_of.isoformat(),
         "lookback_days": cfg.lookback_days,
         "warnings": [],

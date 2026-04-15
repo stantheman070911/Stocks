@@ -1,0 +1,9 @@
+[allowlist]
+description = "Generated local artifacts are ignored by git and not part of source review."
+paths = [
+  '''^\.cache/''',
+  '''^\.venv/''',
+  '''^strategy_output/''',
+  '''^__pycache__/''',
+]
+
