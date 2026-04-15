@@ -11,9 +11,11 @@ import argparse
 import json
 import logging
 import random
+import re
 import threading
 import time
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -63,6 +65,15 @@ def _stoch(high, low, close, k=9, d=3, smooth_k=3):
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+plt.rcParams["font.sans-serif"] = [
+    "PingFang TC",
+    "Heiti TC",
+    "Microsoft JhengHei",
+    "Noto Sans CJK TC",
+    "Arial Unicode MS",
+    "DejaVu Sans",
+]
+plt.rcParams["axes.unicode_minus"] = False
 
 # ════════════════════════════════════════════════════════════════
 #  ▌ Logging — 取代 print 中的錯誤訊息，保留管線進度輸出
@@ -109,6 +120,8 @@ MAX_WORKERS        = 15   # 平行下載執行緒
 
 # 金融股排除關鍵字
 FIN_KW = ["金融", "銀行", "保險", "證券", "票券", "投信", "期貨", "壽險", "產險", "租賃"]
+FIN_KW_PATTERN = re.compile("|".join(map(re.escape, FIN_KW)))
+TWSE_SOURCE_LOOKBACK = 45
 
 # BFIAMU 類股名稱（去除「指數」後綴）→ TWSE t187ap03_L 產業別代碼
 # 修正 FIND-2：top_ind 是中文類別名稱，stock_df["sector"] 是數字代碼，
@@ -206,7 +219,7 @@ class RunConfig:
 class Throttle:
     """節流器。"""
 
-    def __init__(self, lo: float, hi: float, lock: threading.Lock | None = None):
+    def __init__(self, lo: float, hi: float, lock: "threading.Lock | None" = None):
         self.lo = lo
         self.hi = hi
         self.lock = lock
@@ -323,14 +336,79 @@ def write_frame_cache(cfg: RunConfig, namespace: str, key: str, df: pd.DataFrame
         log.debug("寫入 DataFrame 快取失敗 %s: %s", path, e)
 
 
+# 台股已知休市日（補班日則不列入）。
+# TWSE 會在休市日對 T86/BFIAMU/MI_MARGN 回傳 stat != "OK"，
+# 因此加入此表後，recent_weekdays 就能直接跳過，減少不必要的 API 往返。
+# 如遇未涵蓋的假日，各呼叫端的 reason != "ok" 迴圈仍會正確略過。
+# 資料來源：TWSE 休市公告 / 中華民國年曆（2023–2027）
+TW_MARKET_HOLIDAYS: frozenset[date] = frozenset([
+    # 2023
+    date(2023, 1,  2), date(2023, 1, 20), date(2023, 1, 23),
+    date(2023, 1, 24), date(2023, 1, 25), date(2023, 1, 26), date(2023, 1, 27),
+    date(2023, 2, 27), date(2023, 2, 28),
+    date(2023, 4,  3), date(2023, 4,  4), date(2023, 4,  5),
+    date(2023, 6, 22), date(2023, 6, 23),
+    date(2023, 9, 29),
+    date(2023, 10, 9), date(2023, 10, 10),
+    # 2024
+    date(2024, 1,  1),
+    date(2024, 2,  8), date(2024, 2,  9), date(2024, 2, 12),
+    date(2024, 2, 13), date(2024, 2, 14),
+    date(2024, 2, 28),
+    date(2024, 4,  4), date(2024, 4,  5),
+    date(2024, 6, 10),
+    date(2024, 9, 17),
+    date(2024, 10, 10),
+    # 2025
+    date(2025, 1,  1),
+    date(2025, 1, 27), date(2025, 1, 28), date(2025, 1, 29),
+    date(2025, 1, 30), date(2025, 1, 31),
+    date(2025, 2, 28),
+    date(2025, 4,  3), date(2025, 4,  4),
+    date(2025, 5,  1),
+    date(2025, 5, 30), date(2025, 5, 31),
+    date(2025, 10, 6), date(2025, 10, 10),
+    # 2026
+    date(2026, 1,  1), date(2026, 1,  2),
+    date(2026, 2, 16), date(2026, 2, 17), date(2026, 2, 18),
+    date(2026, 2, 19), date(2026, 2, 20),
+    date(2026, 2, 27), date(2026, 2, 28),
+    date(2026, 4,  3),
+    date(2026, 6, 19),
+    date(2026, 9, 25),
+    date(2026, 10, 9), date(2026, 10, 10),
+    # 2027
+    date(2027, 1,  1),
+    date(2027, 2,  5), date(2027, 2,  8), date(2027, 2,  9),
+    date(2027, 2, 10), date(2027, 2, 11),
+    date(2027, 2, 26), date(2027, 2, 28),
+    date(2027, 4,  5),
+    date(2027, 5, 28),
+    date(2027, 10, 11),
+])
+
+
 def recent_weekdays(as_of: date, n: int = 50) -> list[str]:
-    """回傳最近n個工作日的日期字串（YYYYMMDD），由新到舊。"""
+    """回傳最近 n 個台股交易日字串（YYYYMMDD），由新到舊。
+    跳過週末及 TW_MARKET_HOLIDAYS 中已知休市日。
+    未涵蓋的假日由各呼叫端的 reason != 'ok' 迴圈兜底略過。
+    """
     result, d = [], as_of
     while len(result) < n:
-        if d.weekday() < 5:
+        if d.weekday() < 5 and d not in TW_MARKET_HOLIDAYS:
             result.append(d.strftime("%Y%m%d"))
         d -= timedelta(days=1)
     return result
+
+
+def _twse_payload_reason(data: dict | list | None, *, payload_keys: tuple[str, ...] = ("data",)) -> str:
+    """判讀 TWSE 回應狀態。"""
+    if not data or not isinstance(data, dict):
+        return "http_fail"
+    stat_reason = _foreign_fetch_reason(data.get("stat"))
+    if stat_reason != "ok":
+        return stat_reason
+    return "ok" if any(data.get(key) for key in payload_keys) else "empty"
 
 
 def safe_get(url: str, cfg: RunConfig, params: dict | None = None,
@@ -358,12 +436,32 @@ def to_numeric_series(s: pd.Series) -> pd.Series:
 #  ▌ STEP 1 ▸ 上市股票清單
 # ════════════════════════════════════════════════════════════════
 
-def _find_col(columns, keywords: list[str]) -> str | None:
-    """從欄位清單中，用關鍵字模糊比對找出目標欄位名稱"""
-    for col in columns:
-        if any(k in str(col) for k in keywords):
-            return col
-    return None
+def _normalize_col_name(name: str) -> str:
+    """標準化欄位名稱，降低格式差異影響。"""
+    return re.sub(r"[\s_:/()（）-]+", "", str(name)).lower()
+
+
+def _find_col(columns, exact_keywords: list[str], fuzzy_keywords: list[str] | None = None) -> str | None:
+    """優先精準命中欄位名稱，其次才做模糊比對。"""
+    norm_cols = {col: _normalize_col_name(col) for col in columns}
+    exact_targets = {_normalize_col_name(k) for k in exact_keywords}
+    exact_hits = [col for col, norm in norm_cols.items() if norm in exact_targets]
+    if exact_hits:
+        if len(exact_hits) > 1:
+            log.warning("欄位精準命中多個候選 %s → 採用 %s", exact_hits, exact_hits[0])
+        return exact_hits[0]
+
+    fuzzy_targets = [_normalize_col_name(k) for k in (fuzzy_keywords or [])]
+    if not fuzzy_targets:
+        return None
+
+    fuzzy_hits = [
+        col for col, norm in norm_cols.items()
+        if any(target in norm for target in fuzzy_targets)
+    ]
+    if len(fuzzy_hits) > 1:
+        log.warning("欄位模糊命中多個候選 %s → 採用 %s", fuzzy_hits, fuzzy_hits[0])
+    return fuzzy_hits[0] if fuzzy_hits else None
 
 
 def get_stock_list(cfg: RunConfig) -> tuple[pd.DataFrame, str | None]:
@@ -385,10 +483,26 @@ def get_stock_list(cfg: RunConfig) -> tuple[pd.DataFrame, str | None]:
     print(f"  API 原始欄位：{list(df.columns)}")   # 除錯用：印出實際欄位名
 
     # ── 關鍵字模糊偵測欄位（不受 TWSE 改欄名影響）────────────────
-    id_col      = _find_col(df.columns, ["代號", "代碼", "Code", "ID"])
-    name_col    = _find_col(df.columns, ["名稱", "Name"])
-    sector_col  = _find_col(df.columns, ["產業", "類別", "類股", "Industry", "Sector"])
-    capital_col = _find_col(df.columns, ["資本額", "資本", "Capital"])
+    id_col = _find_col(
+        df.columns,
+        ["證券代號", "有價證券代號", "公司代號", "股票代號", "代號", "代碼"],
+        ["code"],
+    )
+    name_col = _find_col(
+        df.columns,
+        ["公司名稱", "股票名稱", "名稱"],
+        ["name"],
+    )
+    sector_col = _find_col(
+        df.columns,
+        ["產業別", "產業類別", "類股類別", "類股", "產業"],
+        ["industry", "sector"],
+    )
+    capital_col = _find_col(
+        df.columns,
+        ["實收資本額", "資本總額", "資本額", "資本"],
+        ["capital"],
+    )
 
     rename_map = {}
     if id_col:      rename_map[id_col]      = "id"
@@ -416,7 +530,7 @@ def get_stock_list(cfg: RunConfig) -> tuple[pd.DataFrame, str | None]:
     before = len(df)
     df["sector"] = df["sector"].fillna("").astype(str)
     df["name"]   = df["name"].fillna("").astype(str)
-    name_has_fin = df["name"].apply(lambda x: any(k in x for k in FIN_KW))
+    name_has_fin = df["name"].str.contains(FIN_KW_PATTERN, regex=True, na=False)
     sector_is_fin = df["sector"].isin(FIN_SECTOR_CODES)
     df = df[~(name_has_fin | sector_is_fin)].copy()
     print(f"  上市總數 {before} → 排除金融後 {len(df)} 檔")
@@ -509,6 +623,11 @@ def get_foreign_ranking(valid_ids: set, cfg: RunConfig) -> tuple[pd.DataFrame, d
     master = pd.concat(frames, axis=1)
     day_cols = sorted([c for c in master.columns if c.startswith("d")], reverse=True)  # 新→舊
 
+    # FIND-6：強制 float dtype，避免 object 欄位在 > 0 比較時靜默強制轉換
+    # _fetch_foreign_day 已對每欄執行 to_numeric_series，但 concat 後個別欄若全為
+    # NaN 有機會落為 object；此處統一轉換，確保 cum_net / consec_buy 計算正確。
+    master[day_cols] = master[day_cols].apply(pd.to_numeric, errors="coerce")
+
     # 累計買超（萬股）
     master["obs_days"] = master[day_cols].notna().sum(axis=1).astype(int)
     master["cum_net"] = master[day_cols].sum(axis=1, skipna=True) / 10000
@@ -516,25 +635,33 @@ def get_foreign_ranking(valid_ids: set, cfg: RunConfig) -> tuple[pd.DataFrame, d
     # 連續買超天數（從最近有效交易日往前數，忽略缺值）
     master["consec_buy"] = master[day_cols].apply(_count_consecutive_positive, axis=1).astype(int)
 
-    # 只保留合法個股
-    master = master[master.index.isin(valid_ids)]
-
-    # 排名
+    # ── 排名在全 T86 宇宙上計算（修正 FIND-15）─────────────────────
+    # 原程式先過濾 valid_ids 再排名，導致 rank_pct 僅反映
+    # 已排除金融股的子集，而非整體市場的外資偏好。
+    # 改為先排名（含所有 T86 個股），再過濾合法個股，
+    # 使 RANK_LOW/RANK_HIGH 的含義與「全市場排名百分位」一致。
+    universe_size = len(master)
     master = master.sort_values("cum_net", ascending=False)
     master["rank"]     = range(1, len(master) + 1)
     master["rank_pct"] = master["rank"] / len(master)
 
+    # 只保留合法個股（過濾後不重新計算排名）
+    filt_valid = master[master.index.isin(valid_ids)]
+
     # 篩選條件：中後段排名 + 連續買超達標
-    filt = master[
-        (master["rank_pct"] >= RANK_LOW) &
-        (master["rank_pct"] <= RANK_HIGH) &
-        (master["consec_buy"] >= MIN_CONSEC_BUY)
+    filt = filt_valid[
+        (filt_valid["rank_pct"] >= RANK_LOW) &
+        (filt_valid["rank_pct"] <= RANK_HIGH) &
+        (filt_valid["consec_buy"] >= MIN_CONSEC_BUY)
     ].copy()
 
-    print(f"  排名中後段({RANK_LOW*100:.0f}%~{RANK_HIGH*100:.0f}%) + 連買≥{MIN_CONSEC_BUY}天 → {len(filt)} 檔")
+    print(
+        f"  T86全宇宙 {universe_size} 檔 → 合法個股 {len(filt_valid)} 檔 → "
+        f"排名中後段({RANK_LOW*100:.0f}%~{RANK_HIGH*100:.0f}%) + 連買≥{MIN_CONSEC_BUY}天 → {len(filt)} 檔"
+    )
     return (
         filt[["cum_net", "consec_buy", "rank", "rank_pct"]].reset_index().rename(columns={"index": "id"}),
-        {"ok_dates": ok_dates, "fetch_stats": dict(fetch_stats)},
+        {"ok_dates": ok_dates, "fetch_stats": dict(fetch_stats), "universe_size": universe_size},
     )
 
 
@@ -575,8 +702,12 @@ def _download_single_price(ticker: str, cfg: RunConfig, min_rows: int = 60, retr
             frame = _normalize_yf_frame(raw, min_rows=min_rows)
             if frame is not None:
                 return frame
-        except Exception as e:
-            log.debug("yf.download(%s) 第 %d 次失敗：%s", ticker, i + 1, e)
+        # FIND-11：使用明確例外類型（yfinance 底層是 requests，
+        # 加上 ValueError/KeyError 覆蓋 JSON 解析與欄位缺失情況）
+        except (OSError, requests.RequestException, ValueError,
+                KeyError, AttributeError, TypeError) as e:
+            log.debug("yf.download(%s) 第 %d 次失敗 [%s]：%s",
+                      ticker, i + 1, type(e).__name__, e)
         time.sleep(0.8 * (i + 1))
     return None
 
@@ -613,8 +744,11 @@ def download_prices(tickers: list[str], cfg: RunConfig) -> tuple[dict[str, pd.Da
                 threads=True,
                 timeout=20,
             )
-        except Exception as e:
-            log.warning("yfinance 批次失敗（%d 檔）：%s", len(batch), e)
+        # FIND-11：明確例外類型（與 _download_single_price 保持一致）
+        except (OSError, requests.RequestException, ValueError,
+                KeyError, AttributeError, TypeError) as e:
+            log.warning("yfinance 批次失敗（%d 檔）[%s]：%s",
+                        len(batch), type(e).__name__, e)
             raw = pd.DataFrame()
 
         for ticker, symbol in zip(batch, symbols):
@@ -685,7 +819,8 @@ def analyze_tech(t: str, df: pd.DataFrame) -> dict | None:
     seg = df.tail(60)
     s_hi = float(seg["High"].max())
     s_lo = float(seg["Low"].min())
-    rng = s_hi - s_lo
+    # D16：明確排除 NaN（高/低點若因全 NaN 欄而為 nan，運算會傳播 NaN）
+    rng = (s_hi - s_lo) if (pd.notna(s_hi) and pd.notna(s_lo)) else 0.0
     fib50 = s_hi - 0.500 * rng if rng > 0 else last_close
     fib38 = s_hi - 0.382 * rng if rng > 0 else last_close
     fib62 = s_hi - 0.618 * rng if rng > 0 else last_close
@@ -734,13 +869,15 @@ def analyze_tech(t: str, df: pd.DataFrame) -> dict | None:
 #  ▌ STEP 5 ▸ 產業別成交量排名
 # ════════════════════════════════════════════════════════════════
 
-def get_top_industries(cfg: RunConfig) -> tuple[set, str | None]:
+def get_top_industries(cfg: RunConfig) -> tuple[set, dict]:
     """取得類股別（industry class）成交金額前 N 大。
     修正：原使用的 MI_INDEX20 其實是「個股」成交量前20，並非類股分類；
     正確端點應為 BFIAMU（類股別成交資訊）。
     """
     print("\n【Step 5】取得產業別成交量前5排名")
-    for date_str in recent_weekdays(cfg.as_of, 20):
+    fetch_stats: Counter[str] = Counter()
+    parse_failures = 0
+    for date_str in recent_weekdays(cfg.as_of, TWSE_SOURCE_LOOKBACK):
         data = safe_get(
             "https://www.twse.com.tw/exchangeReport/BFIAMU",
             cfg,
@@ -748,28 +885,44 @@ def get_top_industries(cfg: RunConfig) -> tuple[set, str | None]:
             cache_namespace="twse/BFIAMU",
             cache_key=date_str,
         )
-        if isinstance(data, dict) and data.get("stat") == "OK" and data.get("data"):
-            cols   = data["fields"]
-            df     = pd.DataFrame(data["data"], columns=cols)
-            vol_c  = next((c for c in cols if "成交金額" in c or "成交值" in c), None)
-            idx_c  = next((c for c in cols if "指數" in c or "類別" in c or "類股" in c), None)
-            if vol_c and idx_c:
-                df[vol_c]  = to_numeric_series(df[vol_c])
-                df[idx_c]  = df[idx_c].astype(str).str.strip()
-                df = df.dropna(subset=[vol_c]).sort_values(vol_c, ascending=False)
-                # 去除「指數」後綴，便於後續 `any(ind in sector ...)` 子字串比對
-                tops = set(df[idx_c].str.replace("指數", "", regex=False).head(TOP_INDUSTRY_COUNT).tolist())
-                print(f"  前{TOP_INDUSTRY_COUNT}大產業：{tops}")
-                return tops, date_str
+        reason = _twse_payload_reason(data)
+        fetch_stats[reason] += 1
+        if reason != "ok":
+            continue
+        cols = data.get("fields") or []
+        rows = data.get("data") or []
+        vol_c = next((c for c in cols if "成交金額" in c or "成交值" in c), None)
+        idx_c = next((c for c in cols if "指數" in c or "類別" in c or "類股" in c), None)
+        if not vol_c or not idx_c:
+            parse_failures += 1
+            continue
+        df = pd.DataFrame(rows, columns=cols)
+        df[vol_c] = to_numeric_series(df[vol_c])
+        df[idx_c] = df[idx_c].astype(str).str.strip()
+        df = df.dropna(subset=[vol_c]).sort_values(vol_c, ascending=False)
+        if df.empty:
+            parse_failures += 1
+            continue
+        tops = set(df[idx_c].str.replace("指數", "", regex=False).head(TOP_INDUSTRY_COUNT).tolist())
+        print(f"  前{TOP_INDUSTRY_COUNT}大產業：{tops}")
+        return tops, {
+            "source_date": date_str,
+            "fetch_stats": dict(fetch_stats),
+            "parse_failures": parse_failures,
+        }
     print("  ⚠ 產業成交量 API 失敗，跳過此過濾")
-    return set(), None
+    return set(), {
+        "source_date": None,
+        "fetch_stats": dict(fetch_stats),
+        "parse_failures": parse_failures,
+    }
 
 
 # ════════════════════════════════════════════════════════════════
 #  ▌ STEP 6 ▸ 融資融券分析
 # ════════════════════════════════════════════════════════════════
 
-def get_margin(tickers: list[str], cfg: RunConfig) -> tuple[pd.DataFrame, str | None]:
+def get_margin(tickers: list[str], cfg: RunConfig) -> tuple[pd.DataFrame, dict]:
     """融資融券彙總。
     修正：TWSE 已將舊 `exchangeReport/MI_MARGN` 的 flat `data[]` schema
     重構為 `rwd/zh/marginTrading/MI_MARGN`，回應裡是 `tables[]`，
@@ -780,7 +933,9 @@ def get_margin(tickers: list[str], cfg: RunConfig) -> tuple[pd.DataFrame, str | 
     """
     print("\n【Step 6】取得融資融券餘額")
     ticker_set = set(tickers)
-    for date_str in recent_weekdays(cfg.as_of, 20):
+    fetch_stats: Counter[str] = Counter()
+    parse_failures = 0
+    for date_str in recent_weekdays(cfg.as_of, TWSE_SOURCE_LOOKBACK):
         data = safe_get(
             "https://www.twse.com.tw/rwd/zh/marginTrading/MI_MARGN",
             cfg,
@@ -788,7 +943,9 @@ def get_margin(tickers: list[str], cfg: RunConfig) -> tuple[pd.DataFrame, str | 
             cache_namespace="twse/MI_MARGN",
             cache_key=date_str,
         )
-        if not (isinstance(data, dict) and data.get("stat") == "OK"):
+        reason = _twse_payload_reason(data, payload_keys=("tables",))
+        fetch_stats[reason] += 1
+        if reason != "ok":
             continue
 
         # 找出「融資融券彙總」細明表：優先用表名，否則退回欄位最多者
@@ -804,6 +961,7 @@ def get_margin(tickers: list[str], cfg: RunConfig) -> tuple[pd.DataFrame, str | 
         if detail is None:
             detail = max(tables, key=lambda t: len(t.get("fields", [])), default=None)
         if not detail or not detail.get("data"):
+            parse_failures += 1
             continue
 
         cols = detail["fields"]
@@ -814,9 +972,11 @@ def get_margin(tickers: list[str], cfg: RunConfig) -> tuple[pd.DataFrame, str | 
         #   資券互抵, 註記
         if len(cols) < 13:
             log.debug("MI_MARGN 欄位數不足（%d）", len(cols))
+            parse_failures += 1
             continue
         if "今日餘額" not in str(cols[6]) or "今日餘額" not in str(cols[12]):
             log.warning("MI_MARGN schema 疑似漂移：欄位6=%s, 欄位12=%s", cols[6], cols[12])
+            parse_failures += 1
             continue
 
         df = pd.DataFrame(rows, columns=[f"c{i}" for i in range(len(cols))])
@@ -843,61 +1003,124 @@ def get_margin(tickers: list[str], cfg: RunConfig) -> tuple[pd.DataFrame, str | 
             "squeeze_ratio": np.round(squeeze, 4),
         })
         print(f"  取得 {len(result)} 檔資料")
-        return result, date_str
+        return result, {
+            "source_date": date_str,
+            "fetch_stats": dict(fetch_stats),
+            "parse_failures": parse_failures,
+        }
 
     print("  ⚠ 融資融券 API 失敗，跳過")
-    return pd.DataFrame(), None
+    return pd.DataFrame(), {
+        "source_date": None,
+        "fetch_stats": dict(fetch_stats),
+        "parse_failures": parse_failures,
+    }
 
 
 # ════════════════════════════════════════════════════════════════
 #  ▌ STEP 7 ▸ 基本面（FinMind，選用）
 # ════════════════════════════════════════════════════════════════
 
-def get_fundamentals(tickers: list[str], cfg: RunConfig) -> pd.DataFrame:
+FINMIND_MAX_WORKERS = 4   # FinMind 並發 worker 上限（避免超過 API 速率限制）
+_FINMIND_SEMAPHORE  = threading.Semaphore(FINMIND_MAX_WORKERS)
+
+
+def _fetch_one_fundamental(
+    t: str,
+    api,
+    start_q: str,
+    end_q: str,
+    cfg: RunConfig,
+    as_of_key: str,
+) -> tuple[dict, str]:
+    """取得單檔基本面（P/E, P/B, ROE, GPM）；回傳 (row_dict, status)。
+    status ∈ {"cached", "network", "failed"}
+    以 _FINMIND_SEMAPHORE 控制最大並發，並在每次網路呼叫後休眠 0.25 s。
+    """
+    cache_key = f"{t}_{as_of_key}"
+    cached_df = read_frame_cache(cfg, "finmind", cache_key)
+    if cached_df is not None and {"id", "PE", "PB", "ROE", "GPM"} <= set(cached_df.columns):
+        return cached_df.iloc[-1][["id", "PE", "PB", "ROE", "GPM"]].to_dict(), "cached"
+
+    with _FINMIND_SEMAPHORE:
+        try:
+            per_df = api.taiwan_stock_per(stock_id=t, start_date=start_q, end_date=end_q)
+            pe, pb = np.nan, np.nan
+            if per_df is not None and not per_df.empty:
+                last_per = per_df.sort_values("date").iloc[-1]
+                pe = last_per.get("PER", np.nan)
+                pb = last_per.get("PBR", np.nan)
+
+            fs = api.taiwan_stock_financial_statement(stock_id=t, start_date=start_q, end_date=end_q)
+            roe, gpm = np.nan, np.nan
+            if fs is not None and not fs.empty:
+                fs = fs.sort_values("date")
+                r = fs[fs["type"] == "ReturnOnEquity"]
+                g = fs[fs["type"] == "GrossProfitMargin"]
+                roe = float(r["value"].iloc[-1]) if not r.empty else np.nan
+                gpm = float(g["value"].iloc[-1]) if not g.empty else np.nan
+
+            row = {"id": t, "PE": pe, "PB": pb, "ROE": roe, "GPM": gpm}
+            write_frame_cache(cfg, "finmind", cache_key, pd.DataFrame([row]))
+            time.sleep(0.25)   # FinMind API 速率限制 — 4 worker × 0.25 s ≈ 16 req/s
+            return row, "network"
+        except (KeyError, ValueError, IndexError, TypeError, AttributeError) as e:
+            log.warning("FinMind 基本面失敗 %s: %s", t, e.__class__.__name__)
+            row = {"id": t, "PE": np.nan, "PB": np.nan, "ROE": np.nan, "GPM": np.nan}
+            write_frame_cache(cfg, "finmind", cache_key, pd.DataFrame([row]))
+            return row, "failed"
+
+
+def get_fundamentals(tickers: list[str], cfg: RunConfig) -> tuple[pd.DataFrame, dict]:
     if not FINMIND_OK or not FINMIND_TOKEN:
         print("\n【Step 7】FinMind token 未設定 → 跳過基本面（可在 CONFIG 填入）")
-        return pd.DataFrame()
+        return pd.DataFrame(), {"cached": 0, "network_fetch": 0, "failures": 0}
 
-    print(f"\n【Step 7】取得基本面資料（FinMind）")
+    print(f"\n【Step 7】取得基本面資料（FinMind，{FINMIND_MAX_WORKERS} 並發）")
     try:
         api = FMLoader()
         api.login_by_token(api_token=FINMIND_TOKEN)
-        start_q = (cfg.as_of - timedelta(days=450)).strftime("%Y-%m-%d")
-        end_q   = cfg.as_of.strftime("%Y-%m-%d")
+        start_q   = (cfg.as_of - timedelta(days=450)).strftime("%Y-%m-%d")
+        end_q     = cfg.as_of.strftime("%Y-%m-%d")
+        as_of_key = cfg.as_of.strftime("%Y%m%d")
 
-        rows = []
-        for t in tqdm(tickers, desc="  基本面", ncols=72):
-            try:
-                # P/E, P/B
-                per_df = api.taiwan_stock_per(stock_id=t, start_date=start_q, end_date=end_q)
-                pe, pb = np.nan, np.nan
-                if per_df is not None and not per_df.empty:
-                    last_per = per_df.sort_values("date").iloc[-1]
-                    pe = last_per.get("PER", np.nan)
-                    pb = last_per.get("PBR", np.nan)
+        rows: list[dict] = []
+        cached_count = network_count = failed_count = 0
 
-                # ROE, GPM
-                fs = api.taiwan_stock_financial_statement(stock_id=t, start_date=start_q, end_date=end_q)
-                roe, gpm = np.nan, np.nan
-                if fs is not None and not fs.empty:
-                    fs = fs.sort_values("date")
-                    r = fs[fs["type"] == "ReturnOnEquity"]
-                    g = fs[fs["type"] == "GrossProfitMargin"]
-                    roe = float(r["value"].iloc[-1]) if not r.empty else np.nan
-                    gpm = float(g["value"].iloc[-1]) if not g.empty else np.nan
-
-                rows.append({"id": t, "PE": pe, "PB": pb, "ROE": roe, "GPM": gpm})
-                time.sleep(0.25)
-            except (KeyError, ValueError, IndexError, TypeError, AttributeError) as e:
-                log.warning("FinMind 基本面失敗 %s: %s", t, e.__class__.__name__)
-                rows.append({"id": t, "PE": np.nan, "PB": np.nan, "ROE": np.nan, "GPM": np.nan})
+        with ThreadPoolExecutor(max_workers=FINMIND_MAX_WORKERS) as pool:
+            future_to_ticker = {
+                pool.submit(_fetch_one_fundamental, t, api, start_q, end_q, cfg, as_of_key): t
+                for t in tickers
+            }
+            pbar = tqdm(as_completed(future_to_ticker), total=len(tickers),
+                        desc="  基本面", ncols=72)
+            for future in pbar:
+                t = future_to_ticker[future]
+                try:
+                    row, status = future.result()
+                    rows.append(row)
+                    if status == "cached":
+                        cached_count += 1
+                    elif status == "network":
+                        network_count += 1
+                    else:
+                        failed_count += 1
+                except Exception as e:
+                    log.warning("FinMind worker 未預期失敗 %s: %s", t, e.__class__.__name__)
+                    rows.append({"id": t, "PE": np.nan, "PB": np.nan, "ROE": np.nan, "GPM": np.nan})
+                    failed_count += 1
 
         df = pd.DataFrame(rows)
-        print(f"  取得 {df['PE'].notna().sum()} 檔 P/E、{df['ROE'].notna().sum()} 檔 ROE")
-        return df
-    except Exception as e:
+        print(
+            f"  取得 {df['PE'].notna().sum()} 檔 P/E、"
+            f"{df['ROE'].notna().sum()} 檔 ROE"
+            f"（快取 {cached_count} 檔 / 網路 {network_count} 檔 / 失敗 {failed_count} 檔）"
+        )
+        return df, {"cached": cached_count, "network_fetch": network_count, "failures": failed_count}
+    except (requests.RequestException, ValueError, TypeError, AttributeError) as e:
+        log.warning("FinMind 初始化失敗：%s", e.__class__.__name__)
         print(f"  ⚠ FinMind 錯誤：{e}")
-        return pd.DataFrame()
+        return pd.DataFrame(), {"cached": 0, "network_fetch": 0, "failures": len(tickers)}
 
 
 # ════════════════════════════════════════════════════════════════
@@ -928,6 +1151,11 @@ def calc_risk(t: str, df: pd.DataFrame, bench: pd.DataFrame) -> dict:
     sr = aligned["stock"].to_numpy()
     br = aligned["bench"].to_numpy()
 
+    # D24：ddof 選擇有意設計，非疏忽（audit 項目 D24）
+    # Beta 使用母體統計量（ddof=0）：Beta 是歷史期間的參數估計值，
+    #   cov/var 基於同一樣本計算，ddof=0 避免小樣本時分母不同所致的比值偏差。
+    # Sharpe / Sortino 使用樣本標準差（ddof=1）：將歷史報酬視為
+    #   未來波動率的估計，ddof=1 是 Bessel 修正，符合金融標準實作。
     cov = float(np.cov(sr, br, ddof=0)[0, 1])
     vb = float(np.var(br, ddof=0))
     beta = cov / vb if vb > 0 else np.nan
@@ -935,12 +1163,12 @@ def calc_risk(t: str, df: pd.DataFrame, bench: pd.DataFrame) -> dict:
     rf_d = RISK_FREE_RATE / TRADING_DAYS_YEAR
     excess = sr - rf_d
     ex_mean = float(excess.mean())
-    ex_std = float(excess.std(ddof=1))
+    ex_std = float(excess.std(ddof=1))   # 樣本標準差 — 波動率估計
     sq_root = np.sqrt(TRADING_DAYS_YEAR)
     sharpe = (ex_mean / ex_std * sq_root) if ex_std > 0 else np.nan
 
     downside = excess[excess < 0]
-    dstd = float(downside.std(ddof=1)) if len(downside) >= 10 else np.nan
+    dstd = float(downside.std(ddof=1)) if len(downside) >= 10 else np.nan  # 樣本標準差
     sortino = (ex_mean / dstd * sq_root) if dstd and dstd > 0 else np.nan
 
     return {
@@ -969,9 +1197,25 @@ def detect_entry(t: str, df: pd.DataFrame, tech: dict, consec: int) -> dict:
         return {}
 
     last, prev = df.iloc[-1], df.iloc[-2]
+
+    # ATR-based tolerance（修正 D26）
+    # 固定 ±0.5% 窗口在高波動股上太緊、低波動股上太鬆。
+    # 改用 ATR(14) 作為絕對容差，fallback 至 0.5% 相對窗口。
+    _atr_tol: float = float(ma20) * 0.005   # fallback
+    if len(df) >= 16 and {"High", "Low", "Close"} <= set(df.columns):
+        _prev_c = df["Close"].shift(1)
+        _tr = pd.concat([
+            df["High"] - df["Low"],
+            (df["High"] - _prev_c).abs(),
+            (df["Low"]  - _prev_c).abs(),
+        ], axis=1).max(axis=1)
+        _atr14 = float(_tr.rolling(14).mean().iloc[-1])
+        if pd.notna(_atr14) and _atr14 > 0:
+            _atr_tol = _atr14
+
     touch_ma20 = (
-        float(last["Low"]) <= float(ma20) * 1.005 and
-        float(last["Close"]) >= float(ma20) * 0.995
+        float(last["Low"]) <= float(ma20) + _atr_tol and
+        float(last["Close"]) >= float(ma20) - _atr_tol
     )
     foreign_ok = consec >= MIN_CONSEC_BUY
     near_fib = tech.get("near_fib50", 0) == 1
@@ -979,7 +1223,10 @@ def detect_entry(t: str, df: pd.DataFrame, tech: dict, consec: int) -> dict:
     trend_ok = float(last["Close"]) > float(prev["Close"])
 
     signal = touch_ma20 and foreign_ok and vol_ok
-    strong_signal = signal and (near_fib or trend_ok)
+    # 強訊號：同時需要「Fib50附近」AND「當日收漲」（修正 FIND-14）
+    # 原 OR 邏輯使 trend_ok（任何收漲日）即可觸發強訊號，過於寬鬆。
+    # 改為 AND：需 Fibonacci 支撐 + 日線收紅雙重確認。
+    strong_signal = signal and near_fib and trend_ok
     flags = {
         "touch_ma20": int(touch_ma20),
         "foreign_ok": int(foreign_ok),
@@ -1046,21 +1293,37 @@ def _component_technical(tech: dict | None) -> float | None:
 
 
 def _component_margin(margin: dict | None) -> float | None:
-    """融資融券分數（0..1）。"""
+    """融資融券分數（0..1）。
+
+    使用明確互斥分區，避免雙重計分（修正 FIND-13）：
+    原程式 `if sr >= 0.20: +8` 與 `if 0.05 < sr < 0.30: +7` 在
+    0.20 <= sr < 0.30 範圍同時觸發，造成隱含的 15 分滿分由兩個
+    獨立條件疊加產生。改為明確四段定義，意圖一目了然。
+    輸出數值與原邏輯完全相同：
+      [0.20, 0.30) → 15   (甜蜜區：強嘎空 + 健康融資)
+      [0.30, ∞)   → 8    (融券佔比過高，嘎空強但偏險)
+      [0.10, 0.20) → 12  (中等嘎空 + 健康融資)
+      (0.05, 0.10) → 9   (輕微嘎空 + 適中融資)
+      sr == 0.05  → 2    (僅觸碰下限，無健康加分)
+      sr < 0.05   → 0
+    """
     if not margin:
         return None
     sr = margin.get("squeeze_ratio", np.nan)
     if pd.isna(sr):
         return None
-    points = 0.0
-    if sr >= 0.20:
-        points += 8
-    elif sr >= 0.10:
-        points += 5
-    elif sr >= 0.05:
-        points += 2
-    if 0.05 < sr < 0.30:
-        points += 7
+    if 0.20 <= sr < 0.30:
+        points = 15.0
+    elif sr >= 0.30:
+        points = 8.0
+    elif 0.10 <= sr < 0.20:
+        points = 12.0
+    elif 0.05 < sr < 0.10:
+        points = 9.0
+    elif sr >= 0.05:        # sr == 精確 0.05
+        points = 2.0
+    else:
+        points = 0.0
     return min(points / SCORE_WEIGHTS["margin"], 1.0)
 
 
@@ -1295,45 +1558,83 @@ def main(cfg: RunConfig):
     manifest["steps"]["technical"] = {"count_out": int(len(tech_map))}
 
     # ── 5. 產業排名 ───────────────────────────────────────────────
-    top_ind, top_ind_date = get_top_industries(cfg)
+    top_ind, top_ind_meta = get_top_industries(cfg)
     manifest["steps"]["industries"] = {
         "count_out": int(len(top_ind)),
-        "source_date": top_ind_date,
+        "source_date": top_ind_meta.get("source_date"),
         "top_industries": sorted(top_ind),
+        "fetch_stats": top_ind_meta.get("fetch_stats", {}),
+        "parse_failures": int(top_ind_meta.get("parse_failures", 0)),
     }
+    if not top_ind_meta.get("source_date"):
+        _push_warning(manifest["warnings"], "產業成交量資料取得失敗，產業過濾已停用")
 
     # ── 6. 融資融券 ───────────────────────────────────────────────
-    margin_df, margin_date = get_margin(cand_ids, cfg)
+    margin_df, margin_meta = get_margin(cand_ids, cfg)
+    # FIND-22：合併前驗證 id 欄位格式，防止爬蟲回傳非4碼代號混入索引
+    if not margin_df.empty and "id" in margin_df.columns:
+        bad_ids = margin_df[~margin_df["id"].str.match(r"^\d{4}$", na=True)]
+        if not bad_ids.empty:
+            log.warning("MI_MARGN 含非4碼代號 %d 筆，已過濾", len(bad_ids))
+            margin_df = margin_df[margin_df["id"].str.match(r"^\d{4}$", na=False)].copy()
     margin_map = {} if margin_df.empty else margin_df.set_index("id").to_dict("index")
     manifest["steps"]["margin"] = {
         "count_out": int(len(margin_df)),
-        "source_date": margin_date,
+        "source_date": margin_meta.get("source_date"),
+        "fetch_stats": margin_meta.get("fetch_stats", {}),
+        "parse_failures": int(margin_meta.get("parse_failures", 0)),
     }
+    if cand_ids and not margin_meta.get("source_date"):
+        _push_warning(manifest["warnings"], "融資融券資料取得失敗，融資分數將重新正規化")
 
     # ── 7. 基本面 ─────────────────────────────────────────────────
-    fund_df = get_fundamentals(cand_ids, cfg)
+    fund_df, fund_meta = get_fundamentals(cand_ids, cfg)
+    # FIND-22：合併前驗證 id 欄位格式
+    if not fund_df.empty and "id" in fund_df.columns:
+        bad_ids = fund_df[~fund_df["id"].str.match(r"^\d{4}$", na=True)]
+        if not bad_ids.empty:
+            log.warning("FinMind 基本面含非4碼代號 %d 筆，已過濾", len(bad_ids))
+            fund_df = fund_df[fund_df["id"].str.match(r"^\d{4}$", na=False)].copy()
     fund_map = {} if fund_df.empty else fund_df.set_index("id").to_dict("index")
     manifest["steps"]["fundamentals"] = {
         "count_out": int(len(fund_df)),
         "roe_count": int(fund_df["ROE"].notna().sum()) if not fund_df.empty and "ROE" in fund_df.columns else 0,
+        "cached": int(fund_meta.get("cached", 0)),
+        "network_fetch": int(fund_meta.get("network_fetch", 0)),
+        "failures": int(fund_meta.get("failures", 0)),
     }
 
     # ── 8. 風險指標 ───────────────────────────────────────────────
     print("\n【Step 8】計算 Beta / Sharpe / Sortino")
-    risk_map = {}
+    risk_map: dict[str, dict] = {}
+    # 記錄每檔交集樣本數（FIND-19）：追蹤因交集不足而被捨棄的個股
+    risk_obs_counts: dict[str, int] = {}
+    risk_dropped_count = 0
     for t in tqdm(cand_ids, desc="  風險指標", ncols=72):
         if t in price_data and not benchmark.empty:
             risk_result = calc_risk(t, price_data[t], benchmark)
             if risk_result:
                 risk_map[t] = risk_result
+                risk_obs_counts[t] = int(risk_result.get("obs_count", 0))
+            else:
+                risk_dropped_count += 1
+                log.debug("calc_risk(%s) 被捨棄（樣本不足或計算失敗）", t)
     risk_available = sum(1 for t in cand_ids if risk_map.get(t))
-    manifest["steps"]["risk"] = {"count_out": int(risk_available)}
+    obs_vals = list(risk_obs_counts.values())
+    manifest["steps"]["risk"] = {
+        "count_out": int(risk_available),
+        "dropped_insufficient_obs": risk_dropped_count,
+        "obs_min":    int(min(obs_vals)) if obs_vals else 0,
+        "obs_median": int(sorted(obs_vals)[len(obs_vals) // 2]) if obs_vals else 0,
+        "obs_max":    int(max(obs_vals)) if obs_vals else 0,
+    }
     if cand_ids and benchmark.empty:
         pass
     elif cand_ids and (len(cand_ids) - risk_available) / len(cand_ids) > 0.2:
         _push_warning(
             manifest["warnings"],
-            f"風險指標缺失比例偏高：{len(cand_ids) - risk_available}/{len(cand_ids)}",
+            f"風險指標缺失比例偏高：{len(cand_ids) - risk_available}/{len(cand_ids)}，"
+            f"其中樣本不足捨棄 {risk_dropped_count} 檔",
         )
 
     # ── 9 & 10. 訊號 + 評分 ─────────────────────────────────────
