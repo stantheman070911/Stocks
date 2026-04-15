@@ -18,8 +18,9 @@ repos:
         entry: mypy tw_scanner
         language: system
         pass_filenames: false
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.30.1
+    hooks:
       - id: gitleaks
         name: gitleaks secret scan
-        entry: gitleaks detect --source . --no-git --redact --exit-code 1
-        language: system
         pass_filenames: false
