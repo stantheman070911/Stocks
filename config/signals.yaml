@@ -1,2 +1,32 @@
-# Phase 0 scaffold for signal settings.
+# Signal parameter configuration — see schema.py:SignalsConfig for field descriptions.
 
+# Moving averages
+ma_short_period: 20
+ma_mid_period: 60
+ma_long_period: 120
+
+# Volatility / oscillator primitives
+atr_period: 14
+rsi_period: 14
+adx_period: 14
+bollinger_period: 20
+bollinger_std: 2.0
+
+# Momentum windows (trading days)
+mom_1m_days: 21
+mom_3m_days: 63
+mom_6m_days: 126
+mom_12_1_long_days: 252   # 12-month total lookback
+mom_12_1_skip_days: 21    # skip last month to avoid short-term reversal
+
+# Foreign institutional flow
+foreign_flow_short_days: 5
+foreign_flow_long_days: 20
+foreign_consec_min: 5     # minimum consecutive net-buy days to qualify
+
+# Risk / drawdown
+realized_vol_days: 60
+drawdown_days: 120
+
+# Volume surge
+vol_surge_ma_days: 20     # baseline MA used for volume-ratio signal

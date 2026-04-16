@@ -1,3 +1,15 @@
-# Phase 0 scaffold. Phase 1 will replace this with validated composition.
-version: 0
+# tw_scanner default configuration (Phase 1).
+#
+# The loader (config/loader.py) composes the following sub-configs into AppConfig:
+#   universe.yaml   — stock universe, liquidity, and size filters
+#   data.yaml       — data sources, caching, throttle parameters
+#   signals.yaml    — signal lookback windows and parameters
+#   scoring.yaml    — normalisation, missing-data policy, weights file pointer
+#   backtest.yaml   — IS/OOS split, horizons, fundamentals embargo windows
+#   costs.yaml      — transaction cost model
+#
+# To override any setting without editing package files, create a file with the
+# same name in the top-level config/ directory.  Loader merges: package default
+# → top-level override (top-level wins on key conflicts).
 
+version: "1"

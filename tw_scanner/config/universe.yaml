@@ -1,2 +1,9 @@
-# Phase 0 scaffold for universe settings.
+# Universe configuration — see schema.py:UniverseConfig for field descriptions.
 
+market: twse                           # 'twse' or 'tpex' (tpex schema-ready, not active in v2)
+liquidity_turnover_20d_min_ntd: 50000000   # NT$50 M minimum 20-day median turnover
+liquidity_turnover_60d_diagnostic: true    # compute 60d turnover for diagnostics; does not gate
+price_floor_ntd: 10.0                  # exclude closes < NT$10 (reduces pump-and-dump exposure)
+top_n: 200                             # candidates.csv row limit
+exclude_industry_categories:
+  - 金融保險  # Finance/Insurance — matched against TaiwanStockInfo.industry_category

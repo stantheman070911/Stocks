@@ -16,4 +16,6 @@ def test_cli_seed_and_dry_run() -> None:
     """Dry-run command succeeds with deterministic seed option."""
     result = CliRunner().invoke(app, ["--seed", "7", "screen", "--dry-run"])
     assert result.exit_code == 0
-    assert "Phase 0 dry run complete" in result.output
+    assert "dry run complete" in result.output
+    assert "config_hash" in result.output
+    assert "missing_mode" in result.output

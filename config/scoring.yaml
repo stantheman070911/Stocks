@@ -1,2 +1,18 @@
-# Phase 0 scaffold for scoring settings.
+# Scoring configuration — see schema.py:ScoringConfig for field descriptions.
 
+# Missing-data policy:
+#   strict              — required signal missing → row excluded from ranking (default)
+#   penalized           — missing → sector_median_z - 0.5 (logged explicitly)
+#   legacy_reweighted   — old apples-to-oranges reweighting (comparison only; warns loudly)
+missing_mode: strict
+
+# Winsorization bounds applied to raw signal values before z-scoring
+winsorize_lower: 0.01
+winsorize_upper: 0.99
+
+# Z-score clipping after normalisation
+zscore_clip: 3.0
+
+# Path to the frozen weights file produced by Phase 5 calibration.
+# null = provisional equal-weighting (research mode only; not for production).
+weights_file: null

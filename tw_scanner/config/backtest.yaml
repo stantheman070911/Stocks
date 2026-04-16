@@ -1,2 +1,23 @@
-# Phase 0 scaffold for backtest settings.
+# Backtest configuration — see schema.py:BacktestConfig for field descriptions.
 
+rebalance_cadence: weekly          # daily | weekly | monthly
+
+# Forward-return horizons to evaluate (trading days)
+horizons:
+  - 5
+  - 10
+  - 20
+  - 60
+
+# In-sample / out-of-sample split
+is_start: "2018-01-01"
+is_end: "2022-12-31"
+oos_start: "2023-01-01"
+
+# Purge + embargo: max(signal lookback) + this many extra trading days
+purge_embargo_extra_days: 20
+
+# Point-in-time embargo applied per report type (calendar days after period end)
+fundamentals_embargo_monthly_days: 15    # monthly revenue → period_end + 15 cal days
+fundamentals_embargo_quarterly_days: 60  # quarterly statements → period_end + 60 cal days
+fundamentals_embargo_annual_days: 90     # annual statements → fiscal_year_end + 90 cal days

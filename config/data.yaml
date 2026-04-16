@@ -1,2 +1,22 @@
-# Phase 0 scaffold for data-source settings.
+# Data-source configuration — see schema.py:DataConfig for field descriptions.
 
+cache_dir: .cache                      # root of the parquet cache
+finmind_quota_requests_per_hour: 600   # free-tier limit; Backer/Sponsor may raise this
+max_workers: 15                        # thread pool size for parallel price downloads
+lookup_days: 30                        # days of foreign investor data to aggregate
+price_lookback_days: 730               # historical OHLCV window in days
+
+# TWSE domain throttle (serialised per lock)
+twse_throttle_min_s: 0.7
+twse_throttle_max_s: 1.5
+
+# Non-TWSE jitter (per thread, no shared lock)
+other_throttle_min_s: 0.05
+other_throttle_max_s: 0.15
+
+# Risk-free rate fallback when the central-bank feed is unavailable
+risk_free_rate_fallback: 0.015
+
+# Benchmark tickers
+benchmark_ticker_primary: TAIEX        # TaiwanStockTotalReturnIndex data_id
+benchmark_ticker_secondary: "0050.TW"  # Taiwan 50 ETF — retained as secondary

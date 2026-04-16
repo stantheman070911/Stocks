@@ -1,2 +1,12 @@
-# Phase 0 scaffold for transaction-cost settings.
+# Transaction cost model — see schema.py:CostsConfig for field descriptions.
+#
+# Taiwan equity round-trip cost breakdown (basis points):
+#   broker_commission_bps  14.25  (0.1425% applied to both buy and sell legs)
+#   transaction_tax_bps    30.0   (0.3% applied to sell leg only)
+#   slippage               varies (estimated from half of high-low range)
+#   ─────────────────────────────
+#   minimum round-trip     ~58.5 bps + slippage
 
+broker_commission_bps: 14.25   # configurable (discount brokers may offer 6–10 bps)
+transaction_tax_bps: 30.0      # fixed by law; 0.1% for ETFs
+slippage_model: half_spread    # half_spread | zero
